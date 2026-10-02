@@ -1,0 +1,3 @@
+.env
+blacklist.db
+__pycache__/
