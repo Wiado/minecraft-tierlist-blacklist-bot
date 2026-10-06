@@ -14,6 +14,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 MODERATOR_ROLE_NAME = os.getenv("MODERATOR_ROLE_NAME", "Moderator")
+TESTER_ROLE_NAME = os.getenv("TESTER_ROLE_NAME", "Tester")
 BLACKLIST_ROLE_NAME = os.getenv("BLACKLIST_ROLE_NAME", "Blacklisted")
 PROTECTED_ROLE_NAMES = [
     "Administrator",
@@ -69,6 +70,21 @@ def moderator_can_use(interaction: discord.Interaction) -> bool:
         return False
     # Moderator itself and every role above it can use /blacklist.
     return interaction.user.top_role >= moderator_role
+
+
+def tester_can_use(interaction: discord.Interaction) -> bool:
+    """Return True for Testers and every role above Tester."""
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    tester_role = role_by_name(interaction.guild, TESTER_ROLE_NAME)
+    if tester_role is None:
+        return False
+    return interaction.user.top_role >= tester_role
+
+
+def is_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
+    """Ticket channels start with ticket-, e.g. ticket-1 or ticket-mace-ht3-wiado."""
+    return isinstance(channel, discord.TextChannel) and channel.name.startswith("ticket-") and len(channel.name) > 7
 
 
 def has_protected_role(member: discord.Member) -> str | None:
@@ -454,6 +470,205 @@ async def timeleft(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(
         f"{user.mention} has **{text}** left on their Blacklist."
     )
+
+
+# ---------------------------------------------------------------------------
+# Ticket commands
+# ---------------------------------------------------------------------------
+
+ticket_group = app_commands.Group(name="ticket", description="Manage high-tier test tickets.")
+
+
+def ticket_channel_error(interaction: discord.Interaction) -> str | None:
+    if not is_ticket_channel(interaction.channel):
+        return "This command can only be used inside a ticket channel (for example, `ticket-1`)."
+    return None
+
+
+@ticket_group.command(name="add", description="Add a Discord user to this ticket.")
+@app_commands.describe(user="The Discord user to add to this ticket.")
+async def ticket_add(interaction: discord.Interaction, user: discord.Member):
+    if not tester_can_use(interaction):
+        await interaction.response.send_message(
+            f"You need the **{TESTER_ROLE_NAME}** role or a role above it to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    error = ticket_channel_error(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    channel = interaction.channel
+    assert isinstance(channel, discord.TextChannel)
+
+    overwrite = channel.overwrites_for(user)
+    overwrite.view_channel = True
+    overwrite.send_messages = True
+    overwrite.read_message_history = True
+    overwrite.attach_files = True
+    overwrite.embed_links = True
+
+    try:
+        await channel.set_permissions(
+            user,
+            overwrite=overwrite,
+            reason=f"Added to ticket by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Discord denied the permission change. Make sure the bot has **Manage Channels**.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.response.send_message(
+            f"Discord returned an error while adding the user: `{exc}`",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ {user.mention} has been **added to this ticket**."
+    )
+
+
+@ticket_group.command(name="remove", description="Remove a Discord user from this ticket.")
+@app_commands.describe(user="The Discord user to remove from this ticket.")
+async def ticket_remove(interaction: discord.Interaction, user: discord.Member):
+    if not tester_can_use(interaction):
+        await interaction.response.send_message(
+            f"You need the **{TESTER_ROLE_NAME}** role or a role above it to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    error = ticket_channel_error(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    guild = interaction.guild
+    assert guild is not None
+
+    moderator_role = role_by_name(guild, MODERATOR_ROLE_NAME)
+    if moderator_role and user.top_role >= moderator_role:
+        await interaction.response.send_message(
+            f"You cannot remove {user.mention} from a ticket because they have the "
+            f"**{MODERATOR_ROLE_NAME}** role or a role above it.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    assert isinstance(channel, discord.TextChannel)
+
+    try:
+        await channel.set_permissions(
+            user,
+            overwrite=None,
+            reason=f"Removed from ticket by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Discord denied the permission change. Make sure the bot has **Manage Channels**.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.response.send_message(
+            f"Discord returned an error while removing the user: `{exc}`",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ {user.mention} has been **removed from this ticket**."
+    )
+
+
+GAMEMODE_CHOICES = [
+    app_commands.Choice(name=name, value=name)
+    for name in [
+        "Mace", "Spear Mace", "UHC", "Nethpot", "Pot",
+        "Sword", "Axe", "SMP", "Crystal", "Diamond SMP",
+    ]
+]
+
+TIER_CHOICES = [
+    app_commands.Choice(name=name, value=name)
+    for name in ["LOW", "HT3", "LT2", "HT2", "LT1", "HT1"]
+]
+
+
+@ticket_group.command(name="rename", description="Rename this ticket with its gamemode, tier and Minecraft username.")
+@app_commands.describe(
+    gamemode="The gamemode being tested.",
+    tier="The tier being tested for.",
+    minecraft_username="The Minecraft username (3-16 characters).",
+)
+@app_commands.choices(gamemode=GAMEMODE_CHOICES, tier=TIER_CHOICES)
+async def ticket_rename(
+    interaction: discord.Interaction,
+    gamemode: app_commands.Choice[str],
+    tier: app_commands.Choice[str],
+    minecraft_username: str,
+):
+    if not tester_can_use(interaction):
+        await interaction.response.send_message(
+            f"You need the **{TESTER_ROLE_NAME}** role or a role above it to use this command.",
+            ephemeral=True,
+        )
+        return
+
+    error = ticket_channel_error(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    if not 3 <= len(minecraft_username) <= 16:
+        await interaction.response.send_message(
+            "The Minecraft username must be between **3 and 16 characters**.",
+            ephemeral=True,
+        )
+        return
+
+    def slugify(value: str) -> str:
+        return value.lower().replace(" ", "-")
+
+    new_name = (
+        f"ticket-{slugify(gamemode.value)}-"
+        f"{tier.value.lower()}-{minecraft_username.lower()}"
+    )
+
+    channel = interaction.channel
+    assert isinstance(channel, discord.TextChannel)
+
+    try:
+        await channel.edit(
+            name=new_name,
+            reason=f"Ticket renamed by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Discord denied the channel rename. Make sure the bot has **Manage Channels**.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.response.send_message(
+            f"Discord returned an error while renaming the ticket: `{exc}`",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"✅ Ticket renamed to **`{new_name}`**."
+    )
+
+
+bot.tree.add_command(ticket_group)
 
 
 async def main():
