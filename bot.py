@@ -37,6 +37,26 @@ WAITLIST_ROLE_NAMES = [
     "NethPot-Waitlist",
 ]
 
+
+# Demotion strike roles: each gamemode has a first- and second-strike role.
+DEMOTION_PREFIXES = {
+    "Mace": "M",
+    "Spear Mace": "SM",
+    "UHC": "U",
+    "Nethpot": "NP",
+    "Pot": "DP",
+    "SMP": "S",
+    "Diamond SMP": "DS",
+    "Axe": "A",
+    "Crystal": "C",
+    "Sword": "SW",
+}
+DEMOTION_ROLE_NAMES = {
+    gamemode: (f"{prefix}/S1", f"{prefix}/S2")
+    for gamemode, prefix in DEMOTION_PREFIXES.items()
+}
+DEMOTION_GAMEMODES = list(DEMOTION_PREFIXES)
+
 if not TOKEN or not GUILD_ID:
     raise RuntimeError("Set DISCORD_TOKEN and GUILD_ID in your .env file.")
 
@@ -113,6 +133,16 @@ async def init_db() -> None:
             expires_at REAL NOT NULL,
             added_by INTEGER NOT NULL,
             created_at REAL NOT NULL
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS demotion_strikes (
+            user_id INTEGER NOT NULL,
+            gamemode TEXT NOT NULL,
+            strikes INTEGER NOT NULL CHECK (strikes IN (1, 2)),
+            PRIMARY KEY (user_id, gamemode)
         )
         """
     )
@@ -211,12 +241,60 @@ async def before_cleanup_loop():
     await bot.wait_until_ready()
 
 
+async def ensure_demotion_roles(guild: discord.Guild) -> None:
+    """Create missing demotion strike roles on startup."""
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        log.error("Cannot create demotion roles: bot needs Manage Roles permission.")
+        return
+    for role_name in [name for pair in DEMOTION_ROLE_NAMES.values() for name in pair]:
+        if role_by_name(guild, role_name) is not None:
+            continue
+        try:
+            await guild.create_role(
+                name=role_name,
+                mentionable=False,
+                reason="Automatic setup of demotion strike roles",
+            )
+            log.info("Created missing demotion role: %s", role_name)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.error("Could not create demotion role %s: %s", role_name, exc)
+
+
+async def get_demotion_strikes(user_id: int, gamemode: str) -> int:
+    assert db is not None
+    async with db.execute(
+        "SELECT strikes FROM demotion_strikes WHERE user_id = ? AND gamemode = ?",
+        (user_id, gamemode),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def set_demotion_strikes(user_id: int, gamemode: str, strikes: int) -> None:
+    assert db is not None
+    if strikes == 0:
+        await db.execute(
+            "DELETE FROM demotion_strikes WHERE user_id = ? AND gamemode = ?",
+            (user_id, gamemode),
+        )
+    else:
+        await db.execute(
+            """INSERT INTO demotion_strikes(user_id, gamemode, strikes)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id, gamemode) DO UPDATE SET strikes = excluded.strikes""",
+            (user_id, gamemode, strikes),
+        )
+    await db.commit()
+
+
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
 
     guild = bot.get_guild(GUILD_ID)
     if guild:
+        await ensure_demotion_roles(guild)
         # Sync commands only to your tier-list server, so they appear quickly.
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
@@ -470,6 +548,111 @@ async def timeleft(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(
         f"{user.mention} has **{text}** left on their Blacklist."
     )
+
+
+# ---------------------------------------------------------------------------
+# Demotion commands
+# ---------------------------------------------------------------------------
+
+DEMOTION_CHOICES = [app_commands.Choice(name=name, value=name) for name in DEMOTION_GAMEMODES]
+
+
+async def sync_demotion_roles(member: discord.Member, gamemode: str, strikes: int) -> None:
+    names = DEMOTION_ROLE_NAMES[gamemode]
+    roles = [role_by_name(member.guild, name) for name in names]
+    if any(role is None for role in roles):
+        missing = [name for name, role in zip(names, roles) if role is None]
+        raise RuntimeError("Missing demotion roles: " + ", ".join(missing))
+    first_role, second_role = roles
+    assert first_role is not None and second_role is not None
+    existing = [r for r in (first_role, second_role) if r in member.roles]
+    new_role = first_role if strikes == 1 else second_role if strikes == 2 else None
+    if existing:
+        await member.remove_roles(*existing, reason=f"Updating {gamemode} demotion strikes")
+    if new_role:
+        await member.add_roles(new_role, reason=f"Updating {gamemode} demotion strikes")
+
+
+@bot.tree.command(name="demote", description="Give a user a demotion strike in a gamemode.")
+@app_commands.describe(user="The user being demoted.", gamemode="The gamemode to record a strike for.")
+@app_commands.choices(gamemode=DEMOTION_CHOICES)
+async def demote(interaction: discord.Interaction, user: discord.Member, gamemode: app_commands.Choice[str]):
+    if not moderator_can_use(interaction):
+        await interaction.response.send_message(
+            f"You need the **{MODERATOR_ROLE_NAME}** role or a role above it to use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    assert guild is not None
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        await interaction.response.send_message("I need **Manage Roles** permission.", ephemeral=True)
+        return
+    mode = gamemode.value
+    names = DEMOTION_ROLE_NAMES[mode]
+    roles = [role_by_name(guild, name) for name in names]
+    if any(role is None for role in roles):
+        await interaction.response.send_message(
+            "Some strike roles are missing. Ensure I have Manage Roles and restart the bot.", ephemeral=True)
+        return
+    if any(role >= me.top_role for role in roles if role):
+        await interaction.response.send_message(
+            "My highest role must be above both demotion roles for this gamemode.", ephemeral=True)
+        return
+
+    current = await get_demotion_strikes(user.id, mode)
+    next_strikes = current + 1
+    try:
+        if next_strikes >= 3:
+            await sync_demotion_roles(user, mode, 0)
+            await set_demotion_strikes(user.id, mode, 0)
+            await interaction.response.send_message(
+                f"⚠️ {user.mention} Has been demoted in {mode}. Please update Tiers! "
+                f"{role_by_name(guild, MODERATOR_ROLE_NAME).mention if role_by_name(guild, MODERATOR_ROLE_NAME) else ''} "
+                f"{role_by_name(guild, 'Admin').mention if role_by_name(guild, 'Admin') else ''}",
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False))
+        else:
+            await sync_demotion_roles(user, mode, next_strikes)
+            await set_demotion_strikes(user.id, mode, next_strikes)
+            await interaction.response.send_message(
+                f"✅ {user.mention} received strike **{next_strikes}/3** in **{mode}** (`{names[next_strikes - 1]}`).")
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Discord denied the role change. Check Manage Roles and the bot's role hierarchy.", ephemeral=True)
+    except (discord.HTTPException, RuntimeError) as exc:
+        log.exception("Demotion failed for user %s in %s", user.id, mode)
+        await interaction.followup.send(f"Could not complete the demotion: `{exc}`", ephemeral=True)
+
+
+@bot.tree.command(name="undemote", description="Clear a user's demotion strikes for a gamemode.")
+@app_commands.describe(user="The user whose strikes should be cleared.", gamemode="The gamemode to clear.")
+@app_commands.choices(gamemode=DEMOTION_CHOICES)
+async def undemote(interaction: discord.Interaction, user: discord.Member, gamemode: app_commands.Choice[str]):
+    if not moderator_can_use(interaction):
+        await interaction.response.send_message(
+            f"You need the **{MODERATOR_ROLE_NAME}** role or a role above it to use this command.", ephemeral=True)
+        return
+    guild = interaction.guild
+    assert guild is not None
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        await interaction.response.send_message("I need **Manage Roles** permission.", ephemeral=True)
+        return
+    mode = gamemode.value
+    names = DEMOTION_ROLE_NAMES[mode]
+    roles = [role_by_name(guild, name) for name in names]
+    if any(role is None for role in roles):
+        await interaction.response.send_message("One or more strike roles are missing. Restart the bot to create them.", ephemeral=True)
+        return
+    if any(role >= me.top_role for role in roles if role):
+        await interaction.response.send_message("My highest role must be above both demotion roles.", ephemeral=True)
+        return
+    try:
+        await sync_demotion_roles(user, mode, 0)
+        await set_demotion_strikes(user.id, mode, 0)
+    except (discord.Forbidden, discord.HTTPException, RuntimeError) as exc:
+        await interaction.response.send_message(f"Could not clear demotion strikes: `{exc}`", ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ Cleared all **{mode}** demotion strikes for {user.mention}.")
 
 
 # ---------------------------------------------------------------------------
